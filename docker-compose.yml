@@ -1,0 +1,150 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: algo-trading-db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: algo_trading
+    ports:
+      - "5434:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: algo-trading-timeseries
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: market_data
+    ports:
+      - "5433:5432"
+    volumes:
+      - timeseries_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: algo-trading-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: algo-trading-api
+    env_file:
+      - .env
+    environment:
+      - ENVIRONMENT=development
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/algo_trading
+      - TIMESCALE_URL=postgresql+asyncpg://postgres:postgres@timescaledb:5432/market_data
+      - REDIS_URL=redis://redis:6379/0
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
+      - ALLOW_PUBLIC_REGISTER=false
+      - APP_PUBLIC_URL=${APP_PUBLIC_URL:-http://localhost:5173}
+      - ANGEL_API_KEY=${ANGEL_API_KEY:-}
+      - ANGEL_STATIC_PUBLIC_IP=${ANGEL_STATIC_PUBLIC_IP:-}
+      - ANGEL_CLIENT_LOCAL_IP=${ANGEL_CLIENT_LOCAL_IP:-127.0.0.1}
+      - ANGEL_MAC_ADDRESS=${ANGEL_MAC_ADDRESS:-00:00:5E:00:53:01}
+      - ANGEL_API_BASE_URL=${ANGEL_API_BASE_URL:-https://apiconnect.angelone.in}
+      - ANGEL_WS_URL=${ANGEL_WS_URL:-wss://smartapisocket.angelone.in}
+      - ANGEL_LOGIN_STATE=${ANGEL_LOGIN_STATE:-algo_trading}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./keys:/app/keys:ro
+    depends_on:
+      postgres:
+        condition: service_started
+      redis:
+        condition: service_started
+    restart: unless-stopped
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+  # Optional: docker-hosted connector (set CLOUDFLARE_TUNNEL_TOKEN in .env).
+  # In Cloudflare tunnel UI, point the hostname to http://api:8000 (not localhost).
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: algo-trading-cloudflared
+    profiles: ["tunnel"]
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    depends_on:
+      - api
+
+  celery-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: algo-trading-celery
+    environment:
+      - ENVIRONMENT=development
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/algo_trading
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+    depends_on:
+      postgres:
+        condition: service_started
+      redis:
+        condition: service_started
+    restart: unless-stopped
+    command: celery -A app.workers.celery_app worker --loglevel=info
+
+  celery-beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: algo-trading-beat
+    environment:
+      - ENVIRONMENT=development
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/algo_trading
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+    depends_on:
+      postgres:
+        condition: service_started
+      redis:
+        condition: service_started
+    restart: unless-stopped
+    command: celery -A app.workers.celery_app beat --loglevel=info
+
+  flower:
+    image: mher/flower:2.0
+    container_name: algo-trading-flower
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+    ports:
+      - "5555:5555"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  timeseries_data:
+  redis_data:
